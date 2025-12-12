@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-파일 카빙 분산 처리 시스템 - 마스터 서버 (병렬 처리 + 진행률 표시)
+파일 카빙 분산 처리 시스템 - 마스터 서버 (병렬 처리 + 고정 멀티라인 진행률)
 """
 
 import socket
@@ -11,8 +11,13 @@ import hashlib
 import threading
 import time
 import sys
+import os
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# Windows 콘솔에서 ANSI escape code 활성화
+if sys.platform == 'win32':
+    os.system('')
 
 # JSON length: 4 bytes
 JSON_LEN_FMT = "!I"
@@ -27,9 +32,9 @@ def format_size(size_bytes):
     """바이트를 읽기 쉬운 형식으로 변환"""
     for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
         if size_bytes < 1024:
-            return f"{size_bytes:.2f} {unit}"
+            return f"{size_bytes:.2f}{unit}"
         size_bytes /= 1024
-    return f"{size_bytes:.2f} PB"
+    return f"{size_bytes:.2f}PB"
 
 
 def format_speed(bytes_per_sec):
@@ -37,56 +42,138 @@ def format_speed(bytes_per_sec):
     return f"{format_size(bytes_per_sec)}/s"
 
 
-class ProgressTracker:
-    """진행률 추적 클래스"""
-    def __init__(self, total, worker_id, description="전송"):
-        self.total = total
-        self.current = 0
-        self.worker_id = worker_id
-        self.description = description
-        self.start_time = time.time()
-        self.last_print_time = 0
+def format_time(seconds):
+    """시간을 읽기 쉬운 형식으로 변환"""
+    if seconds < 60:
+        return f"{seconds:.0f}초"
+    elif seconds < 3600:
+        return f"{seconds/60:.1f}분"
+    else:
+        return f"{seconds/3600:.1f}시간"
+
+
+class MultiProgressDisplay:
+    """여러 워커의 진행률을 고정된 위치에서 업데이트하는 클래스"""
+    
+    def __init__(self, num_workers):
+        self.num_workers = num_workers
         self.lock = threading.Lock()
+        self.worker_states = {}
+        self.initialized = False
+        self.bar_width = 20
+        
+        # 각 워커 상태 초기화
+        for i in range(num_workers):
+            self.worker_states[i] = {
+                'phase': 'waiting',
+                'current': 0,
+                'total': 0,
+                'start_time': None,
+                'address': '',
+                'message': ''
+            }
     
-    def update(self, amount):
+    def init_display(self):
+        """초기 화면 설정 - 워커 수만큼 빈 줄 출력"""
         with self.lock:
-            self.current += amount
-            now = time.time()
-            
-            # 0.5초마다 또는 완료 시 출력
-            if now - self.last_print_time >= 0.5 or self.current >= self.total:
-                self.last_print_time = now
-                self._print_progress()
+            if not self.initialized:
+                # 워커 수만큼 빈 줄 출력
+                for i in range(self.num_workers):
+                    print(f"[워커 {i}] 초기화 중...")
+                self.initialized = True
     
-    def _print_progress(self):
-        elapsed = time.time() - self.start_time
-        if elapsed > 0:
-            speed = self.current / elapsed
-        else:
-            speed = 0
+    def set_worker_info(self, worker_id, address, total):
+        """워커 정보 설정"""
+        with self.lock:
+            self.worker_states[worker_id]['address'] = address
+            self.worker_states[worker_id]['total'] = total
+    
+    def update(self, worker_id, current, phase='sending', message=None):
+        """워커 진행률 업데이트"""
+        with self.lock:
+            state = self.worker_states[worker_id]
+            state['current'] = current
+            state['phase'] = phase
+            
+            if state['start_time'] is None and phase == 'sending':
+                state['start_time'] = time.time()
+            
+            if message:
+                state['message'] = message
+            
+            self._render_all()
+    
+    def set_phase(self, worker_id, phase, message=None):
+        """워커 단계 변경"""
+        with self.lock:
+            self.worker_states[worker_id]['phase'] = phase
+            if message:
+                self.worker_states[worker_id]['message'] = message
+            self._render_all()
+    
+    def _render_all(self):
+        """전체 워커 상태를 고정 위치에 렌더링"""
+        # 커서를 워커 수만큼 위로 이동
+        sys.stdout.write(f"\033[{self.num_workers}A")
         
-        percent = (self.current / self.total) * 100 if self.total > 0 else 0
+        # 각 워커 라인 출력
+        for i in range(self.num_workers):
+            line = self._format_worker_line(i, self.worker_states[i])
+            # 현재 줄 지우고 새로 출력
+            sys.stdout.write(f"\033[K{line}\n")
         
-        # 남은 시간 계산
-        if speed > 0 and self.current < self.total:
-            remaining = (self.total - self.current) / speed
-            eta = f", 남은 시간: {remaining:.0f}초"
-        else:
-            eta = ""
-        
-        print(f"\r[워커 {self.worker_id}] {self.description}: "
-              f"{format_size(self.current)} / {format_size(self.total)} "
-              f"({percent:.1f}%) - {format_speed(speed)}{eta}    ", end="")
         sys.stdout.flush()
     
-    def finish(self):
-        elapsed = time.time() - self.start_time
-        if elapsed > 0:
-            avg_speed = self.total / elapsed
+    def _format_worker_line(self, worker_id, state):
+        """워커 한 줄 포맷팅"""
+        phase = state['phase']
+        addr = state['address'][:15].ljust(15) if state['address'] else '???'.ljust(15)
+        
+        if phase == 'waiting':
+            return f"[워커 {worker_id}] {addr} | 대기 중..."
+        
+        elif phase == 'sending':
+            current = state['current']
+            total = state['total']
+            percent = (current / total * 100) if total > 0 else 0
+            
+            # 프로그레스 바
+            filled = int(self.bar_width * current / total) if total > 0 else 0
+            bar = '█' * filled + '░' * (self.bar_width - filled)
+            
+            # 속도 계산
+            elapsed = time.time() - state['start_time'] if state['start_time'] else 0
+            speed = current / elapsed if elapsed > 0 else 0
+            
+            # 남은 시간
+            if speed > 0 and current < total:
+                eta = format_time((total - current) / speed)
+            else:
+                eta = "--"
+            
+            return (f"[워커 {worker_id}] {addr} | {bar} | {percent:5.1f}% | "
+                   f"{format_size(current):>8}/{format_size(total):>8} | "
+                   f"{format_speed(speed):>10} | 남은: {eta}")
+        
+        elif phase == 'carving':
+            return f"[워커 {worker_id}] {addr} | 카빙 진행 중...                                              "
+        
+        elif phase == 'receiving':
+            return f"[워커 {worker_id}] {addr} | 결과 수신 중... {state['message']}                          "
+        
+        elif phase == 'done':
+            return f"[워커 {worker_id}] {addr} | 완료! {state['message']}                                     "
+        
+        elif phase == 'error':
+            return f"[워커 {worker_id}] {addr} | 오류: {state['message'][:40]}                               "
+        
         else:
-            avg_speed = 0
-        print(f"\r[워커 {self.worker_id}] {self.description} 완료: "
-              f"{format_size(self.total)} ({elapsed:.1f}초, 평균 {format_speed(avg_speed)})    ")
+            return f"[워커 {worker_id}] {addr} | {state.get('message', '')}                                   "
+    
+    def finish(self):
+        """진행률 표시 종료 - 커서를 맨 아래로"""
+        with self.lock:
+            pass  # 이미 맨 아래에 있음
 
 
 class FileCarvingMaster:
@@ -105,6 +192,8 @@ class FileCarvingMaster:
         self.file_hashes = set()
         self.lock = threading.Lock()
         self.recovered_files = []
+        
+        self.progress_display = None
 
     def load_dd_image(self, image_path: str) -> bool:
         p = Path(image_path)
@@ -146,8 +235,8 @@ class FileCarvingMaster:
             return None
         return json.loads(payload.decode("utf-8"))
 
-    def send_binary_stream_from_file_with_progress(self, sock: socket.socket, file_path: Path, 
-                                                    start: int, end: int, worker_id: int) -> None:
+    def send_binary_stream_with_progress(self, sock: socket.socket, file_path: Path, 
+                                         start: int, end: int, worker_id: int) -> None:
         """진행률 표시와 함께 파일 스트리밍 전송"""
         total = end - start
         if total < 0:
@@ -156,11 +245,12 @@ class FileCarvingMaster:
         # 8-byte length
         sock.sendall(struct.pack(BIN_LEN_FMT, total))
 
-        progress = ProgressTracker(total, worker_id, "청크 전송")
-
         with open(file_path, "rb") as f:
             f.seek(start)
             remaining = total
+            sent = 0
+            last_update = 0
+            
             while remaining > 0:
                 to_read = min(self.stream_block_size, remaining)
                 chunk = f.read(to_read)
@@ -168,13 +258,15 @@ class FileCarvingMaster:
                     raise IOError("Unexpected EOF while reading DD image")
                 sock.sendall(chunk)
                 remaining -= len(chunk)
-                progress.update(len(chunk))
-        
-        progress.finish()
+                sent += len(chunk)
+                
+                # 진행률 업데이트 (0.3초마다)
+                now = time.time()
+                if now - last_update >= 0.3 or remaining == 0:
+                    self.progress_display.update(worker_id, sent, 'sending')
+                    last_update = now
 
-    def recv_binary_stream_to_file_with_progress(self, sock: socket.socket, out_path: Path, 
-                                                  worker_id: int, file_num: int = 0) -> int:
-        """진행률 표시와 함께 파일 스트리밍 수신"""
+    def recv_binary_stream_to_file(self, sock: socket.socket, out_path: Path) -> int:
         size_b = self._recv_exact(sock, BIN_LEN_SIZE)
         if not size_b:
             return -1
@@ -183,10 +275,6 @@ class FileCarvingMaster:
         remaining = total
         out_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # 작은 파일은 진행률 생략
-        show_progress = total > 1024 * 1024  # 1MB 이상만 표시
-        
-        received = 0
         with open(out_path, "wb") as f:
             while remaining > 0:
                 chunk = sock.recv(min(65536, remaining))
@@ -194,7 +282,6 @@ class FileCarvingMaster:
                     raise IOError("Socket closed while receiving binary")
                 f.write(chunk)
                 remaining -= len(chunk)
-                received += len(chunk)
 
         return total
 
@@ -238,6 +325,7 @@ class FileCarvingMaster:
         """개별 워커 처리 (별도 스레드에서 실행)"""
         sock = worker["socket"]
         addr = worker["address"][0]
+        chunk_size = read_end - read_start
         
         result_info = {
             "worker_id": worker_id,
@@ -248,26 +336,30 @@ class FileCarvingMaster:
         }
 
         try:
+            # 워커 정보 설정
+            self.progress_display.set_worker_info(worker_id, addr, chunk_size)
+            
             # 1) task info 전송
             self.send_json(sock, task)
             
             # 2) chunk stream 전송 (진행률 표시)
-            self.send_binary_stream_from_file_with_progress(
+            self.send_binary_stream_with_progress(
                 sock, self.dd_image_path, read_start, read_end, worker_id
             )
+            
+            # 3) 카빙 대기
+            self.progress_display.set_phase(worker_id, 'carving', '')
 
-            print(f"[워커 {worker_id}] 워커에서 카빙 진행 중... (대기)")
-
-            # 3) 결과 수신
+            # 4) 결과 수신
             recovered_count = self.receive_results(sock, worker_id)
             
             result_info["success"] = True
             result_info["recovered_count"] = recovered_count
-            print(f"[워커 {worker_id}] ✓ 완료! ({recovered_count}개 파일 복구)")
+            self.progress_display.set_phase(worker_id, 'done', f'{recovered_count}개 파일 복구')
 
         except Exception as e:
             result_info["error"] = str(e)
-            print(f"[워커 {worker_id}] ✗ 오류: {e}")
+            self.progress_display.set_phase(worker_id, 'error', str(e)[:30])
         finally:
             try:
                 sock.close()
@@ -289,7 +381,7 @@ class FileCarvingMaster:
         print(f"  - 워커 수: {n}")
         print(f"  - 청크 크기: ~{format_size(base)}")
         print(f"  - 오버랩: {format_size(self.overlap_size)}")
-        print(f"  - 처리 방식: 병렬 (ThreadPoolExecutor)\n")
+        print()
 
         # 각 워커별 작업 정보 준비
         tasks_args = []
@@ -300,10 +392,6 @@ class FileCarvingMaster:
             read_start = 0 if i == 0 else max(0, start_offset - self.overlap_size // 2)
             read_end = self.image_size if i == n - 1 else min(self.image_size, end_offset + self.overlap_size // 2)
             chunk_size = read_end - read_start
-
-            print(f"[마스터] 워커 {i} ({w['address'][0]})")
-            print(f"  - 담당: {start_offset:,} ~ {end_offset:,}")
-            print(f"  - 전송: {format_size(chunk_size)}")
 
             task = {
                 "task_id": i,
@@ -316,11 +404,17 @@ class FileCarvingMaster:
             }
             tasks_args.append((i, w, task, read_start, read_end))
 
+        # 진행률 디스플레이 초기화
+        self.progress_display = MultiProgressDisplay(n)
+        
         # 병렬 실행
         start_time = time.time()
-        print("\n" + "=" * 60)
+        print("=" * 80)
         print("[마스터] 모든 워커에게 동시 전송 시작!")
-        print("=" * 60 + "\n")
+        print("=" * 80)
+        
+        # 초기 빈 줄 출력
+        self.progress_display.init_display()
 
         with ThreadPoolExecutor(max_workers=n) as executor:
             futures = {
@@ -333,10 +427,15 @@ class FileCarvingMaster:
                 try:
                     result = future.result()
                 except Exception as e:
-                    print(f"[워커 {worker_id}] 스레드 오류: {e}")
+                    self.progress_display.set_phase(worker_id, 'error', str(e)[:30])
 
+        self.progress_display.finish()
+        
         elapsed = time.time() - start_time
-        print(f"\n[마스터] 모든 워커 처리 완료! (총 소요 시간: {elapsed:.1f}초)")
+        print()
+        print("=" * 80)
+        print(f"[마스터] 모든 워커 처리 완료! (총 소요 시간: {format_time(elapsed)})")
+        print("=" * 80)
 
     def receive_results(self, sock: socket.socket, worker_id: int) -> int:
         """워커로부터 결과 수신"""
@@ -345,7 +444,9 @@ class FileCarvingMaster:
             return 0
 
         recovered_count = int(result.get("recovered_count", 0))
-        print(f"[워커 {worker_id}] 복구된 파일 {recovered_count}개 수신 중...")
+        
+        if recovered_count > 0:
+            self.progress_display.set_phase(worker_id, 'receiving', f'0/{recovered_count}')
 
         for i in range(recovered_count):
             meta = self.recv_json(sock)
@@ -353,10 +454,11 @@ class FileCarvingMaster:
                 break
 
             offset = int(meta.get("offset", -1))
-            size = int(meta.get("size", 0))
 
             tmp_path = self.results_dir / f"__tmp_worker{worker_id}_off{offset}.jpg"
-            received = self.recv_binary_stream_to_file_with_progress(sock, tmp_path, worker_id, i)
+            received = self.recv_binary_stream_to_file(sock, tmp_path)
+
+            self.progress_display.set_phase(worker_id, 'receiving', f'{i+1}/{recovered_count}')
 
             if received <= 0:
                 try:
@@ -397,17 +499,17 @@ class FileCarvingMaster:
         return recovered_count
 
     def print_summary(self) -> None:
-        print("\n" + "=" * 60)
-        print("파일 카빙 완료 - 결과 요약")
-        print("=" * 60)
-        print(f"총 복구 파일: {len(self.recovered_files)}개 (중복 제거됨)")
+        print("\n" + "=" * 80)
+        print("  파일 카빙 완료 - 결과 요약")
+        print("=" * 80)
+        print(f"  총 복구 파일: {len(self.recovered_files)}개 (중복 제거됨)")
         
         if not self.recovered_files:
             return
 
         total = sum(x["size"] for x in self.recovered_files)
-        print(f"총 복구 크기: {format_size(total)}")
-        print(f"저장 위치: {self.results_dir.resolve()}")
+        print(f"  총 복구 크기: {format_size(total)}")
+        print(f"  저장 위치: {self.results_dir.resolve()}")
 
         # 워커별 통계
         worker_stats = {}
@@ -418,20 +520,21 @@ class FileCarvingMaster:
             worker_stats[wid]["count"] += 1
             worker_stats[wid]["size"] += f["size"]
 
-        print("\n워커별 복구 현황:")
+        print("\n  워커별 복구 현황:")
         for wid in sorted(worker_stats.keys()):
             stats = worker_stats[wid]
-            print(f"  - 워커 {wid}: {stats['count']}개 파일, {format_size(stats['size'])}")
+            print(f"    - 워커 {wid}: {stats['count']}개 파일, {format_size(stats['size'])}")
 
-        print("\n복구된 파일 목록:")
+        print("\n  복구된 파일 목록:")
         for f in self.recovered_files:
-            print(f"  - {f['filename']} ({format_size(f['size'])}, 워커 {f['worker_id']})")
+            print(f"    - {f['filename']} ({format_size(f['size'])}, 워커 {f['worker_id']})")
+        print("=" * 80)
 
 
 def main():
     import argparse
 
-    parser = argparse.ArgumentParser(description="파일 카빙 마스터 서버 (병렬 처리 + 진행률)")
+    parser = argparse.ArgumentParser(description="파일 카빙 마스터 서버 (병렬 + 고정 멀티라인 진행률)")
     parser.add_argument("image", help="DD 이미지 파일 경로")
     parser.add_argument("--port", "-p", type=int, default=5000)
     parser.add_argument("--overlap", "-o", type=int, default=1, help="오버랩 크기(MB), 기본 1MB")
